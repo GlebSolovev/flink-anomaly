@@ -5,21 +5,34 @@ import org.apache.flink.api.common.restartstrategy.RestartStrategies;
 import org.apache.flink.streaming.api.CheckpointingMode;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
+@SuppressWarnings("SameParameterValue")
 public class TestFlinkStreamsRecover {
+
+    public static final String ANSI_RESET = "\u001B[0m";
+    public static final String ANSI_RED = "\u001B[31m";
 
     private StreamExecutionEnvironment env;
 
+    private static final boolean printLogs = false;
+    private static final int parallelism = 4;
+
+    private void setParallelism(int parallelism) {
+        env.setParallelism(parallelism);
+        env.setMaxParallelism(parallelism);
+    }
+
     private void applyEnvironmentSettings() {
         env.enableCheckpointing(TimeUnit.SECONDS.toMillis(1), CheckpointingMode.AT_LEAST_ONCE);
-        env.setParallelism(1);
-        env.setMaxParallelism(1);
+        setParallelism(parallelism);
         env.setRestartStrategy(
                 RestartStrategies.fixedDelayRestart(10, org.apache.flink.api.common.time.Time.seconds(1)));
     }
@@ -28,6 +41,16 @@ public class TestFlinkStreamsRecover {
     void setUpEnvironment() {
         env = StreamExecutionEnvironment.getExecutionEnvironment();
         applyEnvironmentSettings();
+    }
+
+    private void executeEnvAndCollectResult(DataStream<UnstableData> data) throws Exception {
+        data.addSink(new ConcatenateSink());
+        if (printLogs) data.print();
+
+        env.execute();
+
+        System.out.println("FILTER NAMES: " + UnstableData.validatedNamesLog.get());
+        System.out.println("RESULT NAMES: " + ConcatenateSink.result.get() + "\n");
     }
 
     @Test
@@ -40,8 +63,7 @@ public class TestFlinkStreamsRecover {
         DataStream<UnstableData> processedData = data.filter(
                 (FilterFunction<UnstableData>) UnstableData::waitValidateOrFail);
 
-        processedData.print();
-        env.execute();
+        executeEnvAndCollectResult(processedData);
     }
 
     @Test
@@ -54,12 +76,11 @@ public class TestFlinkStreamsRecover {
         DataStream<UnstableData> processedData = data.filter(
                 (FilterFunction<UnstableData>) UnstableData::waitValidateOrFail);
 
-        processedData.print();
-        env.execute();
+        executeEnvAndCollectResult(processedData);
     }
 
     @Test
-    void testMultipleStreams() throws Exception { // probably, is possible to catch anomaly!
+    void testMultipleStreams() throws Exception {
         DataStream<UnstableData> stream1 = env.fromElements(
                 new UnstableData("a", 1, 100),
                 new UnstableData("b", 1, 100),
@@ -72,9 +93,19 @@ public class TestFlinkStreamsRecover {
         DataStream<UnstableData> processedData = unionStream.filter(
                 (FilterFunction<UnstableData>) UnstableData::waitValidateOrFail);
 
-        processedData.print();
-        env.execute();
+        executeEnvAndCollectResult(processedData);
     }
+
+    public static class ConcatenateSink extends RichSinkFunction<UnstableData> {
+        public static final AtomicReference<String> result = new AtomicReference<>("");
+
+        @Override
+        public void invoke(UnstableData value, Context context) throws Exception {
+            super.invoke(value, context);
+            result.getAndUpdate(res -> res += value.name);
+        }
+    }
+
 
     public static class UnstableData {
         public final String name;
@@ -82,7 +113,16 @@ public class TestFlinkStreamsRecover {
         public final long waitMillis;
 
         // must be static otherwise each recover it will be recovered to initial value
-        public static Map<String, Integer> alreadyFailed = new HashMap<>();
+        public static final Map<String, Integer> alreadyFailed = new ConcurrentHashMap<>();
+
+        // accumulate logs
+        public static final AtomicReference<String> validatedNamesLog = new AtomicReference<>("");
+
+        public static final boolean printLogs = TestFlinkStreamsRecover.printLogs;
+
+        private void log(String message) {
+            if (printLogs) System.out.println(message);
+        }
 
         public UnstableData(String name, int failureTimes, long waitMillis) {
             this.name = name;
@@ -92,14 +132,15 @@ public class TestFlinkStreamsRecover {
         }
 
         public boolean waitValidateOrFail() throws InterruptedException {
-            System.out.println("COMPUTE " + name + ": current failures = " + alreadyFailed);
+            log("COMPUTE " + name + ": current failures = " + alreadyFailed);
             int thisAlreadyFailed = alreadyFailed.get(name);
             if (thisAlreadyFailed < failureTimes) {
-                System.out.println(thisAlreadyFailed);
                 alreadyFailed.put(name, thisAlreadyFailed + 1);
-                System.out.println("Data " + name + " failed");
+                log("Data " + name + " failed");
+                validatedNamesLog.getAndUpdate(log -> log += ANSI_RED + name + ANSI_RESET);
                 throw new UnstableDataFailedException();
             }
+            validatedNamesLog.getAndUpdate(log -> log += name);
             TimeUnit.MILLISECONDS.sleep(waitMillis);
             return true;
         }
