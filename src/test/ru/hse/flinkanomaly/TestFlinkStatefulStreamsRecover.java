@@ -13,29 +13,68 @@ import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.KeyedStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.util.Collector;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
+@SuppressWarnings("SameParameterValue")
+public class TestFlinkStatefulStreamsRecover {
 
-public class Main {
+    public static final String ANSI_RESET = "\u001B[0m";
+    public static final String ANSI_RED = "\u001B[31m";
 
-    public static void main(String[] args) throws Exception {
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    private StreamExecutionEnvironment env;
 
-        // set up checkpoints and recovering
-        env.enableCheckpointing(TimeUnit.SECONDS.toMillis(1), CheckpointingMode.AT_LEAST_ONCE);
-        env.setRestartStrategy(
-                RestartStrategies.fixedDelayRestart(10, org.apache.flink.api.common.time.Time.seconds(1)));
+    private static final boolean printLogs = false;
+    private static final int parallelism = 2;
 
-        // set up parallelism
-        int parallelism = 2;
+    private void setParallelism(int parallelism) {
         env.setParallelism(parallelism);
         env.setMaxParallelism(parallelism);
+    }
 
-        // declare initial stream
-        DataStream<UnstableData> stream = env.fromElements(
+    private void applyEnvironmentSettings() {
+        env.enableCheckpointing(TimeUnit.SECONDS.toMillis(1), CheckpointingMode.AT_LEAST_ONCE);
+        setParallelism(parallelism);
+        env.setRestartStrategy(
+                RestartStrategies.fixedDelayRestart(10, org.apache.flink.api.common.time.Time.seconds(1)));
+    }
+
+    @BeforeEach
+    void setUpEnvironment() {
+        env = StreamExecutionEnvironment.getExecutionEnvironment();
+        applyEnvironmentSettings();
+    }
+
+    private <T> void executeEnvAndCollectResult(DataStream<T> data) throws Exception {
+        env.execute();
+        System.out.println("FILTER NAMES: " + UnstableData.validatedNamesLog.get());
+    }
+
+    @Test
+    void testFewSparseStatefulFails() throws Exception {
+        DataStream<UnstableData> data = env.fromElements(
+                new UnstableData("a", 0, 2000),
+                new UnstableData("b", 1, 2000),
+                new UnstableData("c", 1, 2000),
+                new UnstableData("d", 1, 2000));
+
+        DataStream<UnstableData> processedData = data.filter(
+                (FilterFunction<UnstableData>) UnstableData::waitValidateOrFail);
+
+        KeyedStream<UnstableData, String> keyedData = processedData.keyBy((d) -> "");
+        var concatenatedStream = keyedData.flatMap(new StatefulConcatenateFlatMap());
+
+        executeEnvAndCollectResult(concatenatedStream);
+    }
+
+    @Test
+    void testManyFrequentStatefulFails() throws Exception {
+        DataStream<UnstableData> data = env.fromElements(
                 new UnstableData("a", 0, 500),
                 new UnstableData("b", 0, 500),
                 new UnstableData("c", 0, 500),
@@ -46,19 +85,16 @@ public class Main {
                 new UnstableData("h", 1, 500)
         );
 
-        // filter stream: possibly fail and recover
-        DataStream<UnstableData> processedStream = stream.filter(
+        DataStream<UnstableData> processedData = data.filter(
                 (FilterFunction<UnstableData>) UnstableData::waitValidateOrFail);
 
-        // concatenate all elements
-        KeyedStream<UnstableData, String> keyedStream = processedStream.keyBy((unstableData) -> "");
-        keyedStream.flatMap(new StatefulConcatenate());
+        KeyedStream<UnstableData, String> keyedData = processedData.keyBy((unstableData) -> "");
+        var concatenatedStream = keyedData.flatMap(new StatefulConcatenateFlatMap());
 
-        // execute test
-        env.execute();
+        executeEnvAndCollectResult(concatenatedStream);
     }
 
-    public static class StatefulConcatenate extends RichFlatMapFunction<UnstableData, String> {
+    public static class StatefulConcatenateFlatMap extends RichFlatMapFunction<UnstableData, String> {
 
         private transient ValueState<String> concatResult;
 
@@ -68,7 +104,7 @@ public class Main {
             if (currentResult == null) {
                 currentResult = "";
             }
-            currentResult += value.name;
+            currentResult += value.getName();
             concatResult.update(currentResult);
 
             System.out.println("CURRENT CONCAT RESULT: " + currentResult);
@@ -77,7 +113,7 @@ public class Main {
         @Override
         public void open(Configuration config) {
             ValueStateDescriptor<String> descriptor =
-                    new ValueStateDescriptor<>("concatenate", TypeInformation.of(new TypeHint<>() {
+                    new ValueStateDescriptor<>("concatenation result", TypeInformation.of(new TypeHint<>() {
                     }));
             concatResult = getRuntimeContext().getState(descriptor);
         }
@@ -91,6 +127,19 @@ public class Main {
         // must be static otherwise each recover it will be recovered to initial value
         public static final Map<String, Integer> alreadyFailed = new ConcurrentHashMap<>();
 
+        // accumulate logs
+        public static final AtomicReference<String> validatedNamesLog = new AtomicReference<>("");
+
+        public static final boolean printLogs = TestFlinkStatefulStreamsRecover.printLogs;
+
+        private void log(String message) {
+            if (printLogs) System.out.println(message);
+        }
+
+        public String getName() {
+            return name;
+        }
+
         public UnstableData(String name, int failureTimes, long waitMillis) {
             this.name = name;
             this.failureTimes = failureTimes;
@@ -98,20 +147,26 @@ public class Main {
             alreadyFailed.put(name, 0);
         }
 
-        // method fails this.failureTimes times for each this, then passes
-        // takes this.waitMillis each call
         public boolean waitValidateOrFail() throws InterruptedException {
-            TimeUnit.MILLISECONDS.sleep(waitMillis);
-
+            log("COMPUTE " + name + ": current failures = " + alreadyFailed);
             int thisAlreadyFailed = alreadyFailed.get(name);
             if (thisAlreadyFailed < failureTimes) {
                 alreadyFailed.put(name, thisAlreadyFailed + 1);
+                log("Data " + name + " failed");
+                validatedNamesLog.getAndUpdate(log -> log += ANSI_RED + name + ANSI_RESET);
                 throw new UnstableDataFailedException();
             }
+            validatedNamesLog.getAndUpdate(log -> log += name);
+            TimeUnit.MILLISECONDS.sleep(waitMillis);
             return true;
+        }
+
+        public String toString() {
+            return "OUT " + name + "\n";
         }
     }
 
     public static class UnstableDataFailedException extends RuntimeException {
     }
+
 }
