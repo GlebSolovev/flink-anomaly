@@ -14,12 +14,41 @@ import org.apache.flink.streaming.api.datastream.KeyedStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.util.Collector;
 
+import java.util.Collection;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 
 public class Main {
+
+    public static final String ANSI_RESET = "\u001B[0m";
+    public static final String ANSI_BLUE = "\u001B[34m";
+    public static final String ANSI_RED = "\u001B[31m";
+
+    public static final long defaultWaitMillis = 500;
+
+    public static final String groupA = "group A";
+    public static final List<UnstableData> groupAElements = List.of(
+            new UnstableData('a', 1, defaultWaitMillis, groupA),
+            new UnstableData('b', 1, defaultWaitMillis, groupA),
+            new UnstableData('c', 1, defaultWaitMillis, groupA),
+            new UnstableData('d', 1, defaultWaitMillis, groupA));
+
+    public static final String groupB = "group B";
+    public static final List<UnstableData> groupBElements = List.of(
+            new UnstableData('e', 1, defaultWaitMillis, groupB),
+            new UnstableData('f', 1, defaultWaitMillis, groupB),
+            new UnstableData('g', 1, defaultWaitMillis, groupB),
+            new UnstableData('h', 1, defaultWaitMillis, groupB));
+
+    public static final List<UnstableData> allElements = Stream.of(groupAElements, groupBElements)
+            .flatMap(Collection::stream)
+            .collect(Collectors.toList());
 
     public static void main(String[] args) throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
@@ -35,23 +64,14 @@ public class Main {
         env.setMaxParallelism(parallelism);
 
         // declare initial stream
-        DataStream<UnstableData> stream = env.fromElements(
-                new UnstableData("a", 0, 500),
-                new UnstableData("b", 0, 500),
-                new UnstableData("c", 0, 500),
-                new UnstableData("d", 1, 500),
-                new UnstableData("e", 1, 500),
-                new UnstableData("f", 1, 500),
-                new UnstableData("g", 1, 500),
-                new UnstableData("h", 1, 500)
-        );
+        DataStream<UnstableData> stream = env.fromCollection(allElements);
 
         // filter stream: possibly fail and recover
         DataStream<UnstableData> processedStream = stream.filter(
                 (FilterFunction<UnstableData>) UnstableData::waitValidateOrFail);
 
         // concatenate all elements
-        KeyedStream<UnstableData, String> keyedStream = processedStream.keyBy((unstableData) -> "");
+        KeyedStream<UnstableData, String> keyedStream = processedStream.keyBy((unstableData) -> unstableData.group);
         keyedStream.flatMap(new StatefulConcatenate());
 
         // execute test
@@ -72,6 +92,24 @@ public class Main {
             concatResult.update(currentResult);
 
             System.out.println("CURRENT CONCAT RESULT: " + currentResult);
+
+            if (checkFullGroupIsConcatenated(currentResult, groupAElements)) {
+                System.out.println("RESULT A ELEMENT: " + ANSI_BLUE + currentResult + ANSI_RESET);
+            }
+            if (checkFullGroupIsConcatenated(currentResult, groupBElements)) {
+                System.out.println("RESULT B ELEMENT: " + ANSI_RED + currentResult + ANSI_RESET);
+            }
+        }
+
+        private static boolean checkFullGroupIsConcatenated(String result, List<UnstableData> groupElements) {
+            Set<String> resultNames = result.chars()
+                    .mapToObj(c -> "" + ((char) c))
+                    .collect(Collectors.toSet());
+            Set<String> groupNames = groupElements.stream()
+                    .map(element -> element.name)
+                    .collect(Collectors.toSet());
+
+            return resultNames.containsAll(groupNames);
         }
 
         @Override
@@ -87,15 +125,17 @@ public class Main {
         public final String name;
         public final int failureTimes;
         public final long waitMillis;
+        public final String group;
 
         // must be static otherwise each recover it will be recovered to initial value
         public static final Map<String, Integer> alreadyFailed = new ConcurrentHashMap<>();
 
-        public UnstableData(String name, int failureTimes, long waitMillis) {
-            this.name = name;
+        public UnstableData(char name, int failureTimes, long waitMillis, String group) {
+            this.name = "" + name;
             this.failureTimes = failureTimes;
             this.waitMillis = waitMillis;
-            alreadyFailed.put(name, 0);
+            this.group = group;
+            alreadyFailed.put(this.name, 0);
         }
 
         // method fails this.failureTimes times for each this, then passes
