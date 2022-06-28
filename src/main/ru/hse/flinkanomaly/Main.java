@@ -94,7 +94,6 @@ public class Main {
             this.name = name;
             this.failureTimes = failureTimes;
             this.waitMillis = waitMillis;
-            alreadyFailed.put(this.name, 0);
         }
 
         // method fails this.failureTimes times for each this, then passes
@@ -102,6 +101,7 @@ public class Main {
         public boolean waitValidateOrFail() throws InterruptedException {
             TimeUnit.MILLISECONDS.sleep(waitMillis);
 
+            alreadyFailed.putIfAbsent(name, 0);
             int thisAlreadyFailed = alreadyFailed.get(name);
             if (thisAlreadyFailed < failureTimes) {
                 alreadyFailed.put(name, thisAlreadyFailed + 1);

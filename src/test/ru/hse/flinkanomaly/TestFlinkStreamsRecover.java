@@ -128,11 +128,11 @@ public class TestFlinkStreamsRecover {
             this.name = name;
             this.failureTimes = failureTimes;
             this.waitMillis = waitMillis;
-            alreadyFailed.put(name, 0);
         }
 
         public boolean waitValidateOrFail() throws InterruptedException {
             log("COMPUTE " + name + ": current failures = " + alreadyFailed);
+            alreadyFailed.putIfAbsent(name, 0);
             int thisAlreadyFailed = alreadyFailed.get(name);
             if (thisAlreadyFailed < failureTimes) {
                 alreadyFailed.put(name, thisAlreadyFailed + 1);

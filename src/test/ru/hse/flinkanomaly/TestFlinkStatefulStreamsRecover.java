@@ -36,7 +36,7 @@ public class TestFlinkStatefulStreamsRecover {
 
     private StreamExecutionEnvironment env;
 
-    private static final boolean printLogs = true;
+    private static final boolean printLogs = false;
     private static final long checkpointingIntervalMillis = 1000;
 
     private void setParallelism(int parallelism) {
@@ -228,7 +228,6 @@ public class TestFlinkStatefulStreamsRecover {
             this.failureTimes = failureTimes;
             this.waitMillis = waitMillis;
             this.group = group;
-            alreadyFailed.put(this.name, 0);
         }
 
         public UnstableData(String name, int failureTimes, long waitMillis) {
@@ -254,6 +253,7 @@ public class TestFlinkStatefulStreamsRecover {
 
         public boolean waitValidateOrFail() throws InterruptedException {
             log("COMPUTE " + name + ": current failures = " + alreadyFailed);
+            alreadyFailed.putIfAbsent(name, 0);
             int thisAlreadyFailed = alreadyFailed.get(name);
             if (thisAlreadyFailed < failureTimes) {
                 alreadyFailed.put(name, thisAlreadyFailed + 1);
